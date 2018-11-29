@@ -6,6 +6,7 @@ import (
 	"net/http"
 	_ "net/http/pprof"
 	"time"
+	"fmt"
 )
 
 /*
@@ -28,6 +29,8 @@ func main() {
 		log.Fatal(err)
 	}
 	defer db.Close()
+
+	fmt.Println(db.AllocSize, db.Info().PageSize)
 
 	// operation
 	// ...
