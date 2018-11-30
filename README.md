@@ -110,7 +110,6 @@ fmt.Println("Allocated ID %d", id)
 DB.View()和DB.Update()函数是DB.Begin()函数的包装器。 这些帮助函数将启动事务，执行一个函数，然后在返回错误时安全地关闭事务。 这是使用 Bolt 交易的推荐方式。
 
 但是，有时您可能需要手动开始和结束交易。 您可以直接使用DB.Begin()函数，但请务必关闭事务。
-
 // Start a writable transaction.
 tx, err := db.Begin(true)
 if err != nil {
@@ -138,6 +137,7 @@ db.Update(func(tx *bolt.Tx) error {
     if err != nil {
         return fmt.Errorf("create bucket: %s", err)
     }
+ 
     return nil
 })
 只有在使用 Tx.CreateBucketIfNotExists() 函数不存在的情况下，可以创建一个 bucket 。 在打开数据库之后，为所有顶级 bucket 调用此函数是一种常见模式，因此您可以保证它们存在以备将来事务处理。
@@ -146,14 +146,12 @@ db.Update(func(tx *bolt.Tx) error {
 
 #### 使用 key/value 对
 要将 key/value 对保存到 bucket，请使用 Bucket.Put() 函数：
-
 db.Update(func(tx *bolt.Tx) error {
-    b := tx.Bucket([]byte("MyBucket"))
+    b := tx.Bucket([]byte("MyBucket"))    
     err := b.Put([]byte("answer"), []byte("42"))
     return err
 })
 这将在 MyBucket 的 bucket 中将 “answer” key的值设置为“42”。 要检索这个value，我们可以使用 Bucket.Get() 函数：
-
 db.View(func(tx *bolt.Tx) error {
     b := tx.Bucket([]byte("MyBucket"))
     v := b.Get([]byte("answer"))
@@ -168,11 +166,9 @@ Get() 函数不会返回错误，因为它的操作保证可以正常工作（�
 
 #### 自动增加 bucket 的数量
 通过使用 NextSequence() 函数，您可以让 Bolt 确定一个可用作 key/value 对唯一标识符的序列。看下面的例子。
-
 // CreateUser saves u to the store. The new user ID is set on u once the data is persisted.
 func (s *Store) CreateUser(u *User) error {
-    return s.db.Update(func(tx *bolt.Tx) error {
-   
+    return s.db.Update(func(tx *bolt.Tx) error {   
         // Retrieve the users bucket.
         // This should be created when the DB is first opened.
         
