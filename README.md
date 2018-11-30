@@ -73,6 +73,7 @@ err := db.Update(func(tx *bolt.Tx) error {
 
 err := db.View(func(tx *bolt.Tx) error {
     ...
+ 
     return nil
 })
 您也可以在此闭包中获得数据库的一致视图，但是，在只读事务中不允许进行变异操作。您只能检索存储区，检索值，或者在只读事务中复制数据库。
@@ -82,6 +83,7 @@ err := db.View(func(tx *bolt.Tx) error {
 
 err := db.Batch(func(tx *bolt.Tx) error {
     ...
+    
     return nil
 })
 并发批量调用可以组合成更大的交易。 批处理仅在有多个 goroutine 调用时才有用。
@@ -92,9 +94,10 @@ err := db.Batch(func(tx *bolt.Tx) error {
 
 var id uint64
 err := db.Batch(func(tx *bolt.Tx) error {
+
     // Find last key in bucket, decode as bigendian uint64, increment
     // by one, encode back to []byte, and add new key.
-    
+        
     ...
     id = newValue
     return nil
@@ -169,6 +172,7 @@ Get() 函数不会返回错误，因为它的操作保证可以正常工作（�
 // CreateUser saves u to the store. The new user ID is set on u once the data is persisted.
 func (s *Store) CreateUser(u *User) error {
     return s.db.Update(func(tx *bolt.Tx) error {
+   
         // Retrieve the users bucket.
         // This should be created when the DB is first opened.
         
