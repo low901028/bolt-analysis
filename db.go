@@ -697,6 +697,8 @@ func (db *DB) removeTx(tx *Tx) {
 }
 
 // Update是在读写托管事务上下文中执行一个函数。
+// 若是没有error产生 则事务提交; 否则将会执行回滚, 不论是在函数执行过程中还是事务提交过程中。
+// 在函数内部手动提交或回滚事务都将触发一个panic
 // Update executes a function within the context of a read-write managed transaction.
 // If no error is returned from the function then the transaction is committed.
 // If an error is returned then the entire transaction is rolled back.
@@ -705,11 +707,13 @@ func (db *DB) removeTx(tx *Tx) {
 //
 // Attempting to manually commit or rollback within the function will cause a panic.
 func (db *DB) Update(fn func(*Tx) error) error {
+	// 首先开启一个读写事务
 	t, err := db.Begin(true)
 	if err != nil {
 		return err
 	}
 
+	// 要确保不论是程序执行过程中还是执行commit提交时出现panic都能够完成对应的事务回滚
 	// Make sure the transaction rolls back in the event of a panic.
 	defer func() {
 		if t.db != nil {
@@ -717,12 +721,15 @@ func (db *DB) Update(fn func(*Tx) error) error {
 		}
 	}()
 
+	// 将创建的事务transaction设置为托管事务 防止内部程序手动提交commit
+	// 一旦手动提交commit 则会产生一个panic
 	// Mark as a managed tx so that the inner function cannot manually commit.
 	t.managed = true
 
+	// 一旦内部方法返回error 则会进行事务回滚rollback并返回error
 	// If an error is returned from the function then rollback and return error.
 	err = fn(t)
-	t.managed = false
+	t.managed = false // 取消事务托管
 	if err != nil {
 		_ = t.Rollback()
 		return err
@@ -731,16 +738,21 @@ func (db *DB) Update(fn func(*Tx) error) error {
 	return t.Commit()
 }
 
+// 在托管只读事务的上下文内部执行一个函数
+// 不论返回任何error 都将从View方法返回
+// 与update操作类型 不能在内部函数执行rollback 会导致一个panic
 // View executes a function within the context of a managed read-only transaction.
 // Any error that is returned from the function is returned from the View() method.
 //
 // Attempting to manually rollback within the function will cause a panic.
 func (db *DB) View(fn func(*Tx) error) error {
+	// 开启只读事务
 	t, err := db.Begin(false)
 	if err != nil {
 		return err
 	}
 
+	// 确保在出现panic时 对应的事务能够完成回滚
 	// Make sure the transaction rolls back in the event of a panic.
 	defer func() {
 		if t.db != nil {
@@ -748,9 +760,11 @@ func (db *DB) View(fn func(*Tx) error) error {
 		}
 	}()
 
+	// 防止手动rollback 将事务进行托管
 	// Mark as a managed tx so that the inner function cannot manually rollback.
 	t.managed = true
 
+	// 内部函数执行过程产生了error 则将error返回
 	// If an error is returned from the function then pass it through.
 	err = fn(t)
 	t.managed = false
@@ -765,6 +779,14 @@ func (db *DB) View(fn func(*Tx) error) error {
 
 	return nil
 }
+
+// Batch操作也调用一个内部函数fn，该内部函数fn也算是batch的一部分
+// 特殊情况(除外)
+// 1、并发执行batch则会进行合并到一个单独的Bolt事务中
+// 2、内部函数传递给Batch则会多次调用，不论是否返回error
+// 对于Batch操作来说其边界影响比较是幂等性的，并必须调用者获得执行成功的结果，对应的改变才会永久有效的
+// 通过DB.MaxBatchSize和DB.MaxBatchDelay来调整batch的最大批大小和延迟时长
+// Batch操作仅用于多协程调用时 有用的
 
 // Batch calls fn as part of a batch. It behaves similar to Update,
 // except:
@@ -784,9 +806,11 @@ func (db *DB) View(fn func(*Tx) error) error {
 //
 // Batch is only useful when there are multiple goroutines calling it.
 func (db *DB) Batch(fn func(*Tx) error) error {
+	// error信号
 	errCh := make(chan error, 1)
-
+	// 一次处理一个批次
 	db.batchMu.Lock()
+	// 批次没内容 或 已超过DB设定的批次尺寸最大值： 均需要新建一个batch 并绑定timer 等待delay时间后触发提交
 	if (db.batch == nil) || (db.batch != nil && len(db.batch.calls) >= db.MaxBatchSize) {
 		// There is no existing batch, or the existing batch is full; start a new one.
 		db.batch = &batch{
@@ -794,7 +818,7 @@ func (db *DB) Batch(fn func(*Tx) error) error {
 		}
 		db.batch.timer = time.AfterFunc(db.MaxBatchDelay, db.batch.trigger)
 	}
-	db.batch.calls = append(db.batch.calls, call{fn: fn, err: errCh})
+	db.batch.calls = append(db.batch.calls, call{fn: fn, err: errCh})  // batch调用
 	if len(db.batch.calls) >= db.MaxBatchSize {
 		// wake up batch, it's ready to run
 		go db.batch.trigger()
@@ -802,65 +826,71 @@ func (db *DB) Batch(fn func(*Tx) error) error {
 	db.batchMu.Unlock()
 
 	err := <-errCh
-	if err == trySolo {
+	if err == trySolo {   //
 		err = db.Update(fn)
 	}
 	return err
 }
 
+// 调用
 type call struct {
 	fn  func(*Tx) error
 	err chan<- error
 }
 
+// 批操作
 type batch struct {
 	db    *DB
 	timer *time.Timer
-	start sync.Once
+	start sync.Once      // 用于保证batch操作仅执行一次
 	calls []call
 }
 
+// 触发执行batch操作
 // trigger runs the batch if it hasn't already been run.
 func (b *batch) trigger() {
 	b.start.Do(b.run)
 }
 
+// 在batch中执行事务并将结果回递给DB.Batch
 // run performs the transactions in the batch and communicates results
 // back to DB.Batch.
 func (b *batch) run() {
 	b.db.batchMu.Lock()
-	b.timer.Stop()
+	b.timer.Stop()   // 开始运行batch时的 对应的timer触发器需要停用 以便后续的batch使用
 	// Make sure no new work is added to this batch, but don't break
 	// other batches.
-	if b.db.batch == b {
+	if b.db.batch == b {  // 确保执行的batch没有被改变
 		b.db.batch = nil
 	}
 	b.db.batchMu.Unlock()
 
 retry:
-	for len(b.calls) > 0 {
+	for len(b.calls) > 0 {        // 循环指定batch的调用call
 		var failIdx = -1
-		err := b.db.Update(func(tx *Tx) error {
+		err := b.db.Update(func(tx *Tx) error {          // 调用update来完成batch操作  所有的调用合并一个事务中
 			for i, c := range b.calls {
-				if err := safelyCall(c.fn, tx); err != nil {
-					failIdx = i
+				if err := safelyCall(c.fn, tx); err != nil {    // 调用内部函数fn和对应的事务完成操作
+					failIdx = i                                 // 记录失败调用call
 					return err
 				}
 			}
 			return nil
 		})
 
-		if failIdx >= 0 {
+		if failIdx >= 0 {  // 剔除执行失败的事务
 			// take the failing transaction out of the batch. it's
 			// safe to shorten b.calls here because db.batch no longer
 			// points to us, and we hold the mutex anyway.
 			c := b.calls[failIdx]
-			b.calls[failIdx], b.calls = b.calls[len(b.calls)-1], b.calls[:len(b.calls)-1]
+			b.calls[failIdx], b.calls = b.calls[len(b.calls)-1], b.calls[:len(b.calls)-1]  // 剔除失败的那个调用call 以便后面的重执行
 			// tell the submitter re-run it solo, continue with the rest of the batch
+			// 继续剩余事务的执行 并将失败的调用call单独执行
 			c.err <- trySolo
-			continue retry
+			continue retry   // 重新执行batch
 		}
 
+		// 将结果传回给调用者 不论失败还是成功
 		// pass success, or bolt internal errors, to all callers
 		for _, c := range b.calls {
 			c.err <- err
@@ -885,6 +915,7 @@ func (p panicked) Error() string {
 	return fmt.Sprintf("panic: %v", p.reason)
 }
 
+// 执行事务  并保证事务安全执行
 func safelyCall(fn func(*Tx) error, tx *Tx) (err error) {
 	defer func() {
 		if p := recover(); p != nil {
@@ -894,12 +925,15 @@ func safelyCall(fn func(*Tx) error, tx *Tx) (err error) {
 	return fn(tx)
 }
 
+// 通过系统调用fdatasync来完成数据库文件的处理
+// 虽然NoSync使用并不是必须的正常操作，一旦使用NoSync 则必须强制数据库文件与磁盘同步
 // Sync executes fdatasync() against the database file handle.
 //
 // This is not necessary under normal operation, however, if you use NoSync
 // then it allows you to force the database file to sync against the disk.
 func (db *DB) Sync() error { return fdatasync(db) }
 
+// 检索数据库的持续性能统计数据，仅在事务关闭时才更新。
 // Stats retrieves ongoing performance stats for the database.
 // This is only updated when a transaction closes.
 func (db *DB) Stats() Stats {
