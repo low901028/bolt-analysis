@@ -10,6 +10,8 @@ import (
 	"strings"
 	"runtime/debug"
 	"sync"
+	"log"
+	"errors"
 )
 
 // mmap虚拟内存映射最大值1GB
@@ -533,6 +535,13 @@ func (db *DB) close() error {
 	return nil
 }
 
+// 开启事务
+// 只读事务能够在并发一次使用多个; 而写事务仅能一次使用一个
+// 一旦开启多个写事务会触发锁机制直到当前的写事务完成 后续的其他写事务才能继续
+// 事务不应该相互依赖，比如在一个goroutine里同时打开一个只读事务和读写事务将导致读写事务出现死锁 主要由于数据库database存在变化 需要定期的重新映射data file
+// 但是在只读事务情况 将不会出现该情况
+// Note: 当长时间的读事务执行 需要调整设置DB.InitialMmapSize值足够大以确保写事务存在的潜在阻塞
+//       当使用完一个只读事务 需要关闭该事务，否则旧页数据将不能被清理
 // Begin starts a new transaction.
 // Multiple read-only transactions can be used concurrently but only one
 // write transaction can be used at a time. Starting multiple write transactions
@@ -551,23 +560,29 @@ func (db *DB) close() error {
 // IMPORTANT: You must close read-only transactions after you are finished or
 // else the database will not reclaim old pages.
 func (db *DB) Begin(writable bool) (*Tx, error) {
-	if writable {
-		return db.beginRWTx()
+	if writable {                   // 当前数据操作 属于写  不同的操作采用的事务是不一样 对应的底层实现原理也不一致。
+		return db.beginRWTx()      // 开启读写事务
 	}
-	return db.beginTx()
+	return db.beginTx()				// 开启只读事务
 }
 
+// 开启只读事务
 func (db *DB) beginTx() (*Tx, error) {
+	// 当初始化事务时 需要锁定meta page
+	// 获取meta的锁在mmap锁之前 为了防止写事务获取了meta
 	// Lock the meta pages while we initialize the transaction. We obtain
 	// the meta lock before the mmap lock because that's the order that the
 	// write transaction will obtain them.
 	db.metalock.Lock()
 
+	// 获取mmap的只读锁
+	// 当mmap重新进行内存数据映射时 会获取到一把写锁 这也就导致所有的事务必须在该写锁能够完成映射之前完成各自的事务
 	// Obtain a read-only lock on the mmap. When the mmap is remapped it will
 	// obtain a write lock so all transactions must finish before it can be
 	// remapped.
 	db.mmaplock.RLock()
 
+	// 数据库是否已打开
 	// Exit if the database is not open yet.
 	if !db.opened {
 		db.mmaplock.RUnlock()
@@ -575,80 +590,95 @@ func (db *DB) beginTx() (*Tx, error) {
 		return nil, ErrDatabaseNotOpen
 	}
 
+	// 新建一个事务并与数据库database进行关联 完成数据库初始化
 	// Create a transaction associated with the database.
 	t := &Tx{}
 	t.init(db)
 
+	// 跟踪数据库开启的事务 直到其关闭
 	// Keep track of transaction until it closes.
 	db.txs = append(db.txs, t)
 	n := len(db.txs)
 
+	// 一旦数据库database完成初始化之后 meta page不需要锁定了
 	// Unlock the meta pages.
 	db.metalock.Unlock()
 
+	// 更新数据库database的统计信息
 	// Update the transaction stats.
 	db.statlock.Lock()
-	db.stats.TxN++
-	db.stats.OpenTxN = n
+	db.stats.TxN++       	// 事务个数
+	db.stats.OpenTxN = n  	// 已打开的事务
 	db.statlock.Unlock()
 
-	return t, nil
+	return t, nil          // 返回数据库database关联的事务  接下来可以基于该事务进行读写操作
 }
 
+// 读写事务
 func (db *DB) beginRWTx() (*Tx, error) {
+	// 读写事务必须当前数据库database模式是read-write模式
 	// If the database was opened with Options.ReadOnly, return an error.
 	if db.readOnly {
 		return nil, ErrDatabaseReadOnly
 	}
 
+	// 获取数据库的读写锁 直至对应的事务关闭该锁将被释放
+	// 这也导致了当开启一个写事务时  一次只能运行一个； 直至该事务结束 其他的写事务才有机会操作
 	// Obtain writer lock. This is released by the transaction when it closes.
 	// This enforces only one writer transaction at a time.
 	db.rwlock.Lock()
 
+	// 一旦获取到写锁之后 需要锁定meta 页 这样接下来我们才能完成读写事务的操作
 	// Once we have the writer lock then we can lock the meta pages so that
 	// we can set up the transaction.
 	db.metalock.Lock()
 	defer db.metalock.Unlock()
 
+	// 一切事务的操作都必须保证当前数据库database是开启的
 	// Exit if the database is not open yet.
 	if !db.opened {
 		db.rwlock.Unlock()
 		return nil, ErrDatabaseNotOpen
 	}
 
+	// 创建读写事务并关联数据库database完成初始化
 	// Create a transaction associated with the database.
 	t := &Tx{writable: true}
 	t.init(db)
 	db.rwtx = t
 
+	// 释放一些已关闭的只读事务对应的页
 	// Free any pages associated with closed read-only transactions.
 	var minid txid = 0xFFFFFFFFFFFFFFFF
-	for _, t := range db.txs {
+	for _, t := range db.txs {  // 遍历当前存活的事务 提取最小的事务id
 		if t.meta.txid < minid {
 			minid = t.meta.txid
 		}
 	}
-	if minid > 0 {
+	if minid > 0 {    // 小于最小活跃事务的其他事务 均属于已关闭的事务 可能还占有对应的page
 		db.freelist.release(minid - 1)
 	}
 
-	return t, nil
+	return t, nil   // 返回对应的读写事务
 }
 
+// 移除数据库事务
 // removeTx removes a transaction from the database.
 func (db *DB) removeTx(tx *Tx) {
+	// 释放mmap的读锁 便于读事务的读取操作
 	// Release the read lock on the mmap.
 	db.mmaplock.RUnlock()
 
+	// meta需要锁定
 	// Use the meta lock to restrict access to the DB object.
 	db.metalock.Lock()
 
 	// Remove the transaction.
-	for i, t := range db.txs {
+	for i, t := range db.txs {  // 遍历需要需要删除的事务
 		if t == tx {
 			last := len(db.txs) - 1
-			db.txs[i] = db.txs[last]
-			db.txs[last] = nil
+			db.txs[i] = db.txs[last] // 填充已被删除的事务空位置的内容  使用最后一个事务填充 减少数据移动
+			db.txs[last] = nil       // 置空最后一个位置的事务
 			db.txs = db.txs[:last]
 			break
 		}
@@ -658,6 +688,7 @@ func (db *DB) removeTx(tx *Tx) {
 	// Unlock the meta pages.
 	db.metalock.Unlock()
 
+	// 合并统计数据
 	// Merge statistics.
 	db.statlock.Lock()
 	db.stats.OpenTxN = n
@@ -665,6 +696,7 @@ func (db *DB) removeTx(tx *Tx) {
 	db.statlock.Unlock()
 }
 
+// Update是在读写托管事务上下文中执行一个函数。
 // Update executes a function within the context of a read-write managed transaction.
 // If no error is returned from the function then the transaction is committed.
 // If an error is returned then the entire transaction is rolled back.

@@ -62,17 +62,20 @@ func (p *page) typ() string {
 	return fmt.Sprintf("unknown<%02x>", p.flags)
 }
 
+// 返回页面元数据的指针
 // meta returns a pointer to the metadata section of the page.
 func (p *page) meta() *meta {
 	return (*meta)(unsafe.Pointer(&p.ptr))
 }
 
+// 通过索引检索叶子节点
 // leafPageElement retrieves the leaf node by index
 func (p *page) leafPageElement(index uint16) *leafPageElement {
 	n := &((*[0x7FFFFFF]leafPageElement)(unsafe.Pointer(&p.ptr)))[index]
 	return n
 }
 
+// 检索叶子节点
 // leafPageElements retrieves a list of leaf nodes.
 func (p *page) leafPageElements() []leafPageElement {
 	if p.count == 0 {
@@ -81,6 +84,7 @@ func (p *page) leafPageElements() []leafPageElement {
 	return ((*[0x7FFFFFF]leafPageElement)(unsafe.Pointer(&p.ptr)))[:]
 }
 
+// 通过索引检索分支节点
 // branchPageElement retrieves the branch node by index
 func (p *page) branchPageElement(index uint16) *branchPageElement {
 	return &((*[0x7FFFFFF]branchPageElement)(unsafe.Pointer(&p.ptr)))[index]
@@ -94,6 +98,7 @@ func (p *page) branchPageElements() []branchPageElement {
 	return ((*[0x7FFFFFF]branchPageElement)(unsafe.Pointer(&p.ptr)))[:]
 }
 
+// 将页的N个字节通过标准输出流输出十六进制
 // dump writes n bytes of the page to STDERR as hex output.
 func (p *page) hexdump(n int) {
 	buf := (*[maxAllocSize]byte)(unsafe.Pointer(p))[:n]
@@ -108,11 +113,12 @@ func (s pages) Less(i, j int) bool { return s[i].id < s[j].id }
 
 // branchPageElement represents a node on a branch page.
 type branchPageElement struct {
-	pos   uint32
-	ksize uint32
-	pgid  pgid
+	pos   uint32				// 偏移量
+	ksize uint32				// key大小
+	pgid  pgid					// 页编号
 }
 
+// 返回节点键的字节片（分支节点）
 // key returns a byte slice of the node key.
 func (n *branchPageElement) key() []byte {
 	buf := (*[maxAllocSize]byte)(unsafe.Pointer(n))
@@ -121,18 +127,20 @@ func (n *branchPageElement) key() []byte {
 
 // leafPageElement represents a node on a leaf page.
 type leafPageElement struct {
-	flags uint32
-	pos   uint32
-	ksize uint32
-	vsize uint32
+	flags uint32                  // 类型
+	pos   uint32				  // 偏移量(数据偏移距离)
+	ksize uint32                  // key大小
+	vsize uint32				  // 值大小
 }
 
+// 返回节点键的字节片（叶子节点）
 // key returns a byte slice of the node key.
 func (n *leafPageElement) key() []byte {
 	buf := (*[maxAllocSize]byte)(unsafe.Pointer(n))
 	return (*[maxAllocSize]byte)(unsafe.Pointer(&buf[n.pos]))[:n.ksize:n.ksize]
 }
 
+// 返回节点值的字节列表
 // value returns a byte slice of the node value.
 func (n *leafPageElement) value() []byte {
 	buf := (*[maxAllocSize]byte)(unsafe.Pointer(n))
