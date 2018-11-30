@@ -37,6 +37,7 @@ import (
 func main() {
     // Open the my.db data file in your current directory.
     // It will be created if it doesn't exist.
+    
     db, err := bolt.Open("my.db", 0600, nil)
     if err != nil {
         log.Fatal(err)
@@ -93,6 +94,7 @@ var id uint64
 err := db.Batch(func(tx *bolt.Tx) error {
     // Find last key in bucket, decode as bigendian uint64, increment
     // by one, encode back to []byte, and add new key.
+    
     ...
     id = newValue
     return nil
@@ -169,6 +171,7 @@ func (s *Store) CreateUser(u *User) error {
     return s.db.Update(func(tx *bolt.Tx) error {
         // Retrieve the users bucket.
         // This should be created when the DB is first opened.
+        
         b := tx.Bucket([]byte("users"))
 
         // Generate ID for the user.
