@@ -1,17 +1,15 @@
 package bolt
 
 import (
-	"errors"
 	"fmt"
-	"hash/fnv"
-	"log"
 	"os"
 	"runtime"
-	"runtime/debug"
-	"strings"
-	"sync"
 	"time"
 	"unsafe"
+	"hash/fnv"
+	"strings"
+	"runtime/debug"
+	"sync"
 )
 
 // mmap虚拟内存映射最大值1GB
@@ -45,6 +43,11 @@ const (
 // default page size for db is set to the OS page size.
 var defaultPageSize = os.Getpagesize()
 
+/*
+ * boltdb是以页为单位存储的， 并包含起始的两个meta页，一个或多个页来存储空闲页的页号以及剩下的分支页(bracnchPage)和叶子也(leafPage)
+ * 在创建一个boltdb文件时 通过fwrite和fdatasync系统调用向磁盘写入32KB或16KB的初始化文件
+ * 在打开一个boltdb文件时 使用mmap系统调用创建内存映射只读记录 用来读取文件中各页的数据
+ */
 
 // 一个bucket的集合并写入到磁盘上的文件中
 // 所有的数据访问都需要通过事务来访问，通过对象DB可以获得transaction对象
@@ -236,20 +239,26 @@ func Open(path string,  // 数据库本地地址
 	// Default values for test hooks
 	db.ops.writeAt = db.file.WriteAt
 
+	// 若是数据库不存在 则进行初始化
 	// Initialize the database if it doesn't exist.
 	if info, err := db.file.Stat(); err != nil {
 		return nil, err
-	} else if info.Size() == 0 {
+	} else if info.Size() == 0 {  // 数据文件大小 = 0 则需要进行meta data file初始化
 		// Initialize new files with meta pages.
 		if err := db.init(); err != nil {
 			return nil, err
 		}
 	} else {
+		// 在数据库已完成初始化的情况下
+		// 读取第一页的meta data数据
 		// Read the first meta page to determine the page size.
-		var buf [0x1000]byte
+		var buf [0x1000]byte  // 4k大小buffer
 		if _, err := db.file.ReadAt(buf[:], 0); err == nil {
-			m := db.pageInBuffer(buf[:], 0).meta()
-			if err := m.validate(); err != nil {
+			m := db.pageInBuffer(buf[:], 0).meta()  // 读取第一页的meta数据
+			if err := m.validate(); err != nil {   // 验证
+				// 获取系统的页大小来填充boltdb的page size
+				// Note: 若是第一页是无效的并且操作系统使用不同的page size来创建数据库的那么会导致我们不能访问数据库database
+				// 因此任何针对meta数据改变 再覆盖都会导致对应的数据库不可访问
 				// If we can't read the page size, we can assume it's the same
 				// as the OS -- since that's how the page size was chosen in the
 				// first place.
@@ -264,6 +273,7 @@ func Open(path string,  // 数据库本地地址
 		}
 	}
 
+	// 初始化数据页池
 	// Initialize page pool.
 	db.pagePool = sync.Pool{
 		New: func() interface{} {
@@ -271,26 +281,34 @@ func Open(path string,  // 数据库本地地址
 		},
 	}
 
+	// 内存映射缓存数据文件 增强数据访问速度
 	// Memory map the data file.
 	if err := db.mmap(options.InitialMmapSize); err != nil {
 		_ = db.close()
 		return nil, err
 	}
 
+	// 读取freelist
 	// Read in the freelist.
 	db.freelist = newFreelist()
 	db.freelist.read(db.page(db.meta().freelist))
 
+	// 标记数据库已打开 并返回db对象 能够进行read和write操作
 	// Mark the database as opened and return.
 	return db, nil
 }
 
+// 打开底层内存映射文件并初始化元引用
+// 参数：minsz 新的mmap最小的尺寸
 // mmap opens the underlying memory-mapped file and initializes the meta references.
 // minsz is the minimum size that the new mmap can be.
 func (db *DB) mmap(minsz int) error {
+	// 拿到mmap锁
 	db.mmaplock.Lock()
 	defer db.mmaplock.Unlock()
 
+	// 数据库文件信息
+	// 进行内存映射文件 需要当前的boltdb的大小 超过数据库page size的2倍以上大小 否则不需要进行映射
 	info, err := db.file.Stat()
 	if err != nil {
 		return fmt.Errorf("mmap stat error: %s", err)
@@ -298,35 +316,43 @@ func (db *DB) mmap(minsz int) error {
 		return fmt.Errorf("file size too small")
 	}
 
+	// 确保size是最小的尺寸 保证最终确定的映射文件的大小是OK的
 	// Ensure the size is at least the minimum size.
 	var size = int(info.Size())
 	if size < minsz {
 		size = minsz
 	}
+	// 确定mmamp映射文件的大小（在mmap系统调用时指定映射文件的起始偏移量以及偏移的长度 即可确定映射文件的范围）
 	size, err = db.mmapSize(size)
 	if err != nil {
 		return err
 	}
 
+	// 引用所有的mmap的引用(保证对应的映射是可用的)
 	// Dereference all mmap references before unmapping.
 	if db.rwtx != nil {
 		db.rwtx.root.dereference()
 	}
 
+	// 对于老数据要先进行取消映射的操作
 	// Unmap existing data before continuing.
 	if err := db.munmap(); err != nil {
 		return err
 	}
 
+	// 将数据库文件以字节序列的方式映射到内存中
 	// Memory-map the data file as a byte slice.
 	if err := mmap(db, size); err != nil {
 		return err
 	}
 
+	// 数据库文件中前2页时meta数据页 前面已对数据进行mmap内存映射 需要进行验证数据库是否正常可用
 	// Save references to the meta pages.
 	db.meta0 = db.page(0).meta()
 	db.meta1 = db.page(1).meta()
 
+	// 验证第一页、第二页的meta：若是两页都验证失败会返回一个error
+	// 当meta0验证失败 那么我们可以通过meta1来进行恢复 反之亦然。
 	// Validate the meta pages. We only return an error if both meta pages fail
 	// validation, since meta0 failing validation means that it wasn't saved
 	// properly -- but we can recover using meta1. And vice-versa.
@@ -339,6 +365,7 @@ func (db *DB) mmap(minsz int) error {
 	return nil
 }
 
+// 取消数据库文件与内存间的映射(一般在进行数据mmap映射时 已存在映射的老数据需要进行这一步操作)
 // munmap unmaps the data file from memory.
 func (db *DB) munmap() error {
 	if err := munmap(db); err != nil {
@@ -347,28 +374,35 @@ func (db *DB) munmap() error {
 	return nil
 }
 
+// 确定适当的mmap大小 根据给定的数据库尺寸，最小是32KB，以双倍的增长：32KB、64KB、128KB...直至达到1GB，
+// 当对应的mmap大小超过1GB后 接下来的增长每次都以1GB来增长 直至达到maxMapSize
+// 一旦mmap的大小超过允许的最大映射尺寸 则返回一个error
 // mmapSize determines the appropriate size for the mmap given the current size
 // of the database. The minimum size is 32KB and doubles until it reaches 1GB.
 // Returns an error if the new mmap size is greater than the max allowed.
 func (db *DB) mmapSize(size int) (int, error) {
 	// Double the size from 32KB until 1GB.
+	// 当mmap大小未超过1GB时 从32KB 以双倍增长
 	for i := uint(15); i <= 30; i++ {
 		if size <= 1<<i {
 			return 1 << i, nil
 		}
 	}
 
+	// 是否已超过mmap所分配最大尺寸
 	// Verify the requested size is not above the maximum allowed.
 	if size > maxMapSize {
 		return 0, fmt.Errorf("mmap too large")
 	}
 
+	// 已超过1GB 则以每次增长1GB继续增长 直至达到maxMapSize
 	// If larger than 1GB then grow by 1GB at a time.
 	sz := int64(size)
 	if remainder := sz % int64(maxMmapStep); remainder > 0 {
 		sz += int64(maxMmapStep) - remainder
 	}
 
+	// 确保mmap的大小是page size的整数倍 便于数据读取
 	// Ensure that the mmap size is a multiple of the page size.
 	// This should always be true since we're incrementing in MBs.
 	pageSize := int64(db.pageSize)
@@ -384,13 +418,21 @@ func (db *DB) mmapSize(size int) (int, error) {
 	return int(sz), nil
 }
 
+// 创建新的数据库(database)文件并初始化元数据页
+// 通过init来初始化一个空的数据库database,对应的boltdb的数据库文件的基本格式：是以页为基本单位，一个数据库文件由若干个页组成(页的大小由操作系统的pagesize来决定)
+// 初始化的数据库文件默认情况下是4页，其中前2页用来存 meta data 第三页存放freelist的页面  第四页存放K/V的页面
+// freelist和K/V数据存放的页面 并不限于第三页和第四页
 // init creates a new database file and initializes its meta pages.
 func (db *DB) init() error {
+	// 根据系统的页尺寸设定数据库的pagesize
+	// 数据读取一般都是按页读取
 	// Set the page size to the OS page size.
 	db.pageSize = os.Getpagesize()
 
+	// 创建一个buffer来容纳两个meta page
 	// Create two meta pages on a buffer.
 	buf := make([]byte, db.pageSize*4)
+	// 前两页存放meta data
 	for i := 0; i < 2; i++ {
 		p := db.pageInBuffer(buf[:], pgid(i))
 		p.id = pgid(i)
@@ -408,22 +450,26 @@ func (db *DB) init() error {
 		m.checksum = m.sum64()
 	}
 
+	// 存放freelist空白页记录
 	// Write an empty freelist at page 3.
 	p := db.pageInBuffer(buf[:], pgid(2))
 	p.id = pgid(2)
 	p.flags = freelistPageFlag
 	p.count = 0
 
+	// 存放K/V记录页
 	// Write an empty leaf page at page 4.
 	p = db.pageInBuffer(buf[:], pgid(3))
 	p.id = pgid(3)
 	p.flags = leafPageFlag
 	p.count = 0
 
+	// 将buffer写入到boltdb的数据库文件
 	// Write the buffer to our data file.
 	if _, err := db.ops.writeAt(buf, 0); err != nil {
 		return err
 	}
+	// 将buffer中的数据通过fdatasync调用内核的磁盘页缓存进行刷盘
 	if err := fdatasync(db); err != nil {
 		return err
 	}
@@ -431,26 +477,29 @@ func (db *DB) init() error {
 	return nil
 }
 
+// 释放数据库相关的资源
+// 在数据库关闭之前 所有的事务操作必须先关闭,不管read-write事务 还是read-only事务
 // Close releases all database resources.
 // All transactions must be closed before closing the database.
 func (db *DB) Close() error {
-	db.rwlock.Lock()
+	db.rwlock.Lock()                 // 读写锁
 	defer db.rwlock.Unlock()
 
-	db.metalock.Lock()
+	db.metalock.Lock()              // 元数据锁
 	defer db.metalock.Unlock()
 
-	db.mmaplock.RLock()
+	db.mmaplock.RLock()            // mmap内存映射锁
 	defer db.mmaplock.RUnlock()
 
 	return db.close()
 }
 
+// 数据库关闭
 func (db *DB) close() error {
 	if !db.opened {
 		return nil
 	}
-
+	// 释放原有分配内容
 	db.opened = false
 
 	db.freelist = nil
@@ -466,13 +515,13 @@ func (db *DB) close() error {
 	// Close file handles.
 	if db.file != nil {
 		// No need to unlock read-only file.
-		if !db.readOnly {
+		if !db.readOnly {  // 非只读事务模式下 数据库被单一的进程独占 需要释放对应的文件锁
 			// Unlock the file.
 			if err := funlock(db); err != nil {
 				log.Printf("bolt.Close(): funlock error: %s", err)
 			}
 		}
-
+		// 关于对应的数据库文件的描述符
 		// Close the file descriptor.
 		if err := db.file.Close(); err != nil {
 			return fmt.Errorf("db file close: %s", err)
@@ -1012,18 +1061,39 @@ type Info struct {
 	PageSize int
 }
 
+/*
+     |--------header--------|
+     |    id(0/1)      		|		页号
+     |     0x40        		|		flags类型
+     |     0           		|		存储元素数
+     |     0           		|		是否有后续页
+     |-------- ptr ---------|  		页头结束
+     |    0xED0CDAED    	|		魔数(固定)
+     |    2             	|		版本号
+     |    0x1000        	|		页大小（4kb）
+	 |    flags         	|		保留字段
+     |    root          	|		根bucket的头信息
+     |    freelist      	|		存放空闲页面的页号
+     |    pgid          	|		总页数
+     |    txid           	|		上一次事务id
+     |    checksum       	|		哈希校验(排除该字段其他的字段)
+     |    0x00           	|		meta记录结束
+     | -------- end --------|
+ */
+// 元数据页
 type meta struct {
-	magic    uint32
-	version  uint32
-	pageSize uint32
-	flags    uint32
-	root     bucket
-	freelist pgid
-	pgid     pgid
-	txid     txid
-	checksum uint64
+	magic    uint32		// 魔数； 0xED0CDAED
+	version  uint32		// boltdb文件格式的版本号 = 2
+	pageSize uint32     // boltdb文件的页大小
+	flags    uint32     // 保留字段
+	root     bucket		// boltdb根bucket的头信息
+	freelist pgid		// boltdb文件中存在的freelist的页号，用来存放空闲页面的页号
+	pgid     pgid		// boltdb文件中总的页数
+	txid     txid		// 上一次写数据库database的事务id  可作为当前boltdb的修改版本号，执行读写事务时+1， 只读事务不变
+	checksum uint64		// 其他字段的64位FNV-1哈希校验
 }
 
+// 验证boltdb 的meta数据是否有效 主要根据magic 、version、checksum是否改变来作为依据
 // validate checks the marker bytes and version of the meta page to ensure it matches this binary.
 func (m *meta) validate() error {
 	if m.magic != magic {
@@ -1041,27 +1111,35 @@ func (m *meta) copy(dest *meta) {
 	*dest = *m
 }
 
+// 将meta写入页
 // write writes the meta onto a page.
 func (m *meta) write(p *page) {
+	// 参数检查
 	if m.root.root >= m.pgid {
 		panic(fmt.Sprintf("root bucket pgid (%d) above high water mark (%d)", m.root.root, m.pgid))
 	} else if m.freelist >= m.pgid {
 		panic(fmt.Sprintf("freelist pgid (%d) above high water mark (%d)", m.freelist, m.pgid))
 	}
 
+	// 由于数据库(database)的meta数据是存在前两页的 故而对应的页号是0或1
+	// 通过事务ID来确定当前的meta的所在的页号
+	// Note：由于txid每次在写数据库时+1 这样就保证了meta的页交替被更新
 	// Page id is either going to be 0 or 1 which we can determine by the transaction ID.
 	p.id = pgid(m.txid % 2)
-	p.flags |= metaPageFlag
+	p.flags |= metaPageFlag     // 设置flag = metaPageFlag
 
+	// 计算meta的数据校验和 便于后面验证meta数据
 	// Calculate the checksum.
 	m.checksum = m.sum64()
-
+    // 将meta信息拷贝到页面P中的缓存相应位置
 	m.copy(p.meta())
 }
 
+// meta数据的校验和
 // generates the checksum for the meta.
 func (m *meta) sum64() uint64 {
 	var h = fnv.New64a()
+	//
 	_, _ = h.Write((*[unsafe.Offsetof(meta{}.checksum)]byte)(unsafe.Pointer(m))[:])
 	return h.Sum64()
 }

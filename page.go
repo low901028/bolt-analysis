@@ -1,10 +1,10 @@
 package bolt
 
 import (
+	"unsafe"
 	"fmt"
 	"os"
 	"sort"
-	"unsafe"
 )
 
 const pageHeaderSize = int(unsafe.Offsetof(((*page)(nil)).ptr))
@@ -26,21 +26,34 @@ const (
 )
 
 type pgid uint64
-
+/*
+ * page的格式
+     * * * * * header * * * *        页头
+	 *  	  id            *
+	 *        flags         *
+	 *        count         *
+	 *        overflow      *
+	 * * * * * ptr  * * * * *         页内存数据的起始处(也是页头结尾)
+	 *						*
+	 *		elements     	*
+	 *						*
+     * * * * * * * *  * * * *         elements格式根据不同的page类型而不同
+ */
+ // page指的是内存中的页
 type page struct {
-	id       pgid
-	flags    uint16
-	count    uint16
-	overflow uint32
-	ptr      uintptr
+	id       pgid      // 从数据库文件mmap内存映射中读取一页的索引值
+	flags    uint16    // 页面类型：branchPageFlag、leafPageFlag、metaPageFlag和freelistPageFlag
+	count    uint16    // 页内存储的元素个数；只在branchPage或leafPage中有用，对应的元素分别为branchPageElement和leafPageElement
+	overflow uint32    // 当前页是否有后续页，如果有，overflow表示后续页的数量，如果没有，则它的值为0，主要用于记录连续多页；
+	ptr      uintptr   // 用于标记页头结尾或者页内存储数据的起始处，一个页的页头就是由上述id、flags、count和overflow构成。需要注意的是，ptr本身不是页头的组成部分，它不是页的一部分，也不被存于磁盘上。具体的数据结构
 }
 
 // typ returns a human readable page type string used for debugging.
 func (p *page) typ() string {
 	if (p.flags & branchPageFlag) != 0 {
-		return "branch"
+		return "branch"                   // B+树内节点
 	} else if (p.flags & leafPageFlag) != 0 {
-		return "leaf"
+		return "leaf" 					  // B+树叶子节点
 	} else if (p.flags & metaPageFlag) != 0 {
 		return "meta"
 	} else if (p.flags & freelistPageFlag) != 0 {
